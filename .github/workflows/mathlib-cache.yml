@@ -1,0 +1,69 @@
+name: Mathlib cache
+on:
+  push:
+    branches: [mathlib-cache]
+  workflow_dispatch:
+permissions:
+  contents: write
+env:
+  MATHLIB_COMMIT: e8ba86fa9744dd8d90f48c1752bc735f61a4ca81
+  TAG: mathlib-cache-e8ba86fa
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out Mathlib at the pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: leanprover-community/mathlib4
+          ref: ${{ env.MATHLIB_COMMIT }}
+      - name: Install elan
+        run: |
+          set -euo pipefail
+          (curl -sSfL https://elan.lean-lang.org/elan-init.sh || curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh) > "$RUNNER_TEMP/elan-init.sh"
+          sh "$RUNNER_TEMP/elan-init.sh" -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Download the cache files without decompressing them
+        run: |
+          set -euo pipefail
+          export MATHLIB_CACHE_DIR="$RUNNER_TEMP/mathlib-cache"
+          mkdir -p "$MATHLIB_CACHE_DIR"
+          lean --version
+          lake exe cache get-
+          ls "$MATHLIB_CACHE_DIR" | grep -c '\.ltar$'
+          du -sh "$MATHLIB_CACHE_DIR"
+      - name: Pack
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          (cd mathlib-cache && ls | grep '\.ltar$' | LC_ALL=C sort > ../ltar-files.txt)
+          n=$(wc -l < ltar-files.txt)
+          test "$n" -gt 5000
+          tar -cf mathlib-cache.tar -C mathlib-cache -T ltar-files.txt
+          mkdir out
+          split -b 1900M -d -a 2 mathlib-cache.tar out/mathlib-cache.tar.part-
+          {
+            echo "mathlib4 commit: $MATHLIB_COMMIT"
+            echo "toolchain: $(cat "$GITHUB_WORKSPACE/lean-toolchain")"
+            echo "ltar files: $n"
+            echo "tar bytes: $(stat -c %s mathlib-cache.tar)"
+            echo "tar sha256: $(sha256sum mathlib-cache.tar | cut -d' ' -f1)"
+          } > out/INFO.txt
+          (cd out && sha256sum mathlib-cache.tar.part-* > SHA256SUMS)
+          cat out/INFO.txt
+          ls -l out
+      - name: Publish as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/out"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber *
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "Mathlib build cache at e8ba86fa" \
+              --notes "The compiled cache files (.ltar) of leanprover-community/mathlib4 at commit $MATHLIB_COMMIT, as fetched by 'lake exe cache get-', in one tar split into parts. Join the parts with cat, untar into the Mathlib cache directory, and run 'lake exe cache unpack' in a checkout of that commit. Mathlib is licensed under Apache 2.0." \
+              *
+          fi
